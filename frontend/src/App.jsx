@@ -1,11 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Capacitor } from '@capacitor/core';
+// import { Capacitor } from '@capacitor/core'; // Uncomment if using Capacitor
 
 const RiceGuardApp = () => {
   // ---------------------------------------------------------------------------
   // CONFIGURATION
   // ---------------------------------------------------------------------------
-  // ⚠️ REPLACE WITH YOUR LAPTOP IP IF TESTING ON REAL PHONE
+  // ⚠️ Point this to your FastAPI Backend URL
   const API_BASE = ""; 
   // ---------------------------------------------------------------------------
 
@@ -16,7 +16,7 @@ const RiceGuardApp = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   
-  // History State (Hidden by default)
+  // History State
   const [history, setHistory] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -34,7 +34,7 @@ const RiceGuardApp = () => {
 
   // Wake up backend & Fetch History
   useEffect(() => {
-    fetch(`${API_BASE}/health`).catch(() => {});
+    fetch(`${API_BASE}/health`).catch(() => console.log("Backend not waking up yet..."));
     fetchHistory();
   }, []);
 
@@ -42,7 +42,10 @@ const RiceGuardApp = () => {
     try {
       const res = await fetch(`${API_BASE}/history`);
       const data = await res.json();
-      if (Array.isArray(data)) setHistory(data);
+      if (Array.isArray(data)) {
+        setHistory(data);
+        console.log("History loaded:", data); // Debugging
+      }
     } catch (e) {
       console.error("History fetch failed", e);
     }
@@ -62,7 +65,6 @@ const RiceGuardApp = () => {
     if (!isCameraOpen) return;
     
     if (!window.DeviceOrientationEvent) {
-       console.log("DeviceOrientationEvent not supported - Running in Degraded Mode");
        setCanCapture(true);
        return;
     }
@@ -71,26 +73,17 @@ const RiceGuardApp = () => {
       const pitch = e.beta || 0;
       const roll = e.gamma || 0;
 
-      if (Math.abs(pitch) > 3 || Math.abs(roll) > 3) {
+      if (Math.abs(pitch) > 10 || Math.abs(roll) > 10) { // Increased tolerance slightly
         setGuidance("Keep phone flat");
         setCanCapture(false);
-        triggerVibration(200); 
+        triggerVibration(50); 
       } else {
         setGuidance("Ready to capture");
         setCanCapture(true);
       }
     };
     
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      DeviceOrientationEvent.requestPermission()
-        .then(res => {
-          if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation);
-        })
-        .catch(console.error);
-    } else {
-      window.addEventListener('deviceorientation', handleOrientation);
-    }
-
+    window.addEventListener('deviceorientation', handleOrientation);
     return () => window.removeEventListener('deviceorientation', handleOrientation);
   }, [isCameraOpen]);
 
@@ -111,8 +104,10 @@ const RiceGuardApp = () => {
   const handleHistoryClick = (item) => {
     // Load a history item into the main view
     setPreview(item.url);
-    setResults(null); // Clear detailed stats as we only have the image
-    setError(`Loaded from history: ${new Date(item.created_at).toLocaleTimeString()}`);
+    // If we have stats saved in history, we could ideally restore them here
+    // For now, we just show the image as per the requirements
+    setResults(null); 
+    setError(`Loaded scan from ${item.timestamp}`);
     setSidebarOpen(false); // Close sidebar on selection
     stopCamera();
   };
@@ -140,8 +135,7 @@ const RiceGuardApp = () => {
         setTimeout(async () => {
             await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
         }, 200);
-      } catch (err) {
-      }
+      } catch (err) {}
     }
   };
 
@@ -158,8 +152,7 @@ const RiceGuardApp = () => {
           facingMode: 'environment', 
           aspectRatio: 1, 
           width: { ideal: 1080 },
-          height: { ideal: 1080 },
-          advanced: [{ focusMode: 'continuous' }] 
+          height: { ideal: 1080 }
         }
       });
       if (videoRef.current) {
@@ -206,20 +199,37 @@ const RiceGuardApp = () => {
       formData.append('file', selectedFile);
 
       const response = await fetch(`${API_BASE}/analyze`, { method: 'POST', body: formData });
-      const data = await response.json();
-
+      
+      // Safety check for non-200 responses
       if (!response.ok) {
-        triggerVibration(500); 
-        throw new Error(data.detail || "Server error");
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || "Server error");
       }
 
-      if (data.total_grains === 0) {
+      const data = await response.json();
+
+      if (data.total_grains === 0 && !data.warnings.includes("Screenshot detected")) {
         setResults(null);
-        setError("No rice grains detected. Please place grains on a flat surface.");
+        setError("No rice grains detected.");
         triggerVibration(500); 
       } else {
         setResults(data);
-        setTimeout(fetchHistory, 2000); 
+        
+        // --- SENIOR DEV FIX: OPTIMISTIC UPDATE ---
+        // Don't wait for the DB. Create the history item NOW using the data we just got.
+        // If the backend failed to upload to Cloudinary, we use the base64 visualization as fallback.
+        const newHistoryItem = {
+           url: data.image_url || `data:image/jpeg;base64,${data.visualization}`,
+           timestamp: data.timestamp, // "6:10 PM" from backend
+           stats: {
+             total: data.total_grains,
+             whole: data.whole_grains,
+             broken: data.broken_grains
+           }
+        };
+
+        // Add to top of list instantly
+        setHistory(prevHistory => [newHistoryItem, ...prevHistory]);
       }
       
     } catch (err) {
@@ -250,7 +260,7 @@ const RiceGuardApp = () => {
   return (
     <div className="main-layout">
       {/* -------------------------------------------------------- */}
-      {/* GLOBAL STYLES INCLUDING SLIDING DRAWER CSS */}
+      {/* GLOBAL STYLES */}
       {/* -------------------------------------------------------- */}
       <style>{`
         body { margin: 0; background-color: #f8fafc; overflow-x: hidden; }
@@ -276,17 +286,17 @@ const RiceGuardApp = () => {
         .close-btn { background: none; border: none; font-size: 1.5rem; color: #64748b; cursor: pointer; padding: 0; line-height: 1; }
         
         .history-list { padding: 1rem; overflow-y: auto; flex: 1; }
-        .history-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 8px; cursor: pointer; transition: 0.2s; margin-bottom: 8px; border: 1px solid transparent; }
-        .history-item:hover { background: #f1f5f9; border-color: #cbd5e0; }
+        .history-item { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 8px; cursor: pointer; transition: 0.2s; margin-bottom: 8px; border: 1px solid #f1f5f9; }
+        .history-item:hover { background: #f8fafc; border-color: #cbd5e0; }
         .thumb { width: 50px; height: 50px; border-radius: 6px; object-fit: cover; background: #eee; border: 1px solid #e2e8f0; }
-        .meta { display: flex; flex-direction: column; font-size: 0.85rem; }
-        .meta-date { color: #64748b; font-size: 0.75rem; margin-top: 2px; }
-        .meta-title { font-weight: 600; color: #334155; }
+        .meta { display: flex; flex-direction: column; font-size: 0.85rem; width: 100%; }
+        .meta-time { color: #1e293b; font-weight: 600; font-size: 0.95rem; }
+        .meta-subtitle { font-size: 0.75rem; color: #64748b; margin-top: 2px; display: flex; justify-content: space-between; }
         
         /* FLOATING HISTORY TOGGLE BUTTON */
         .history-toggle {
           position: fixed; bottom: 24px; left: 24px; z-index: 40;
-          background: #1e293b; color: white; border: none;
+          background: #0f172a; color: white; border: none;
           width: 56px; height: 56px; border-radius: 50%;
           box-shadow: 0 4px 12px rgba(0,0,0,0.25);
           display: flex; align-items: center; justify-content: center;
@@ -297,8 +307,6 @@ const RiceGuardApp = () => {
 
         /* MAIN CONTENT STYLES */
         .app-content { width: 100%; max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
-        
-        /* --- ORIGINAL COMPANY UI STYLES (UNTOUCHED) --- */
         .card { background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
         .header { text-align: center; margin-bottom: 2rem; }
         .header h1 { margin: 0; color: #1a202c; font-size: 2rem; }
@@ -339,7 +347,6 @@ const RiceGuardApp = () => {
         .btn-camera { background: #000000; color: white; margin-bottom: 1rem; width: 100%; }
         .btn-primary:disabled { background: #94a3b8; cursor: not-allowed; }
         
-        /* --- NEW STYLES: OVERLAYS --- */
         .overlay-badge {
             position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
             padding: 8px 16px; border-radius: 20px; font-weight: 600; color: white;
@@ -348,7 +355,6 @@ const RiceGuardApp = () => {
             text-align: center; white-space: nowrap;
         }
 
-        /* --- NEW INSTRUCTION BOX --- */
         .instruction-tip {
             position: absolute; 
             bottom: 60px; /* Positioned above the Ready/Status badge */
@@ -372,19 +378,23 @@ const RiceGuardApp = () => {
       
       <div className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
-           <h2 className="sidebar-title">History</h2>
+           <h2 className="sidebar-title">Recent Scans</h2>
            <button className="close-btn" onClick={() => setSidebarOpen(false)}>×</button>
         </div>
         <div className="history-list">
           {history.length === 0 ? (
-            <div style={{textAlign: 'center', color: '#cbd5e0', padding: '20px', fontSize: '0.9rem'}}>No history yet</div>
+            <div style={{textAlign: 'center', color: '#cbd5e0', padding: '20px', fontSize: '0.9rem'}}>No history found</div>
           ) : (
             history.map((item, idx) => (
               <div key={idx} className="history-item" onClick={() => handleHistoryClick(item)}>
-                <img src={item.url} alt="thumb" className="thumb" />
+                <img src={item.url} alt="scan" className="thumb" />
                 <div className="meta">
-                   <span className="meta-title">Rice Analysis</span>
-                   <span className="meta-date">{new Date(item.created_at).toLocaleDateString()} {new Date(item.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                   {/* UPDATED: Displays the exact time sent by backend (e.g., 6:00 pm) */}
+                   <span className="meta-time">{item.timestamp}</span>
+                   <div className="meta-subtitle">
+                     <span>Rice Analysis</span>
+                     {item.stats && <span>{item.stats.total} Grains</span>}
+                   </div>
                 </div>
               </div>
             ))
@@ -432,9 +442,9 @@ const RiceGuardApp = () => {
                       />
                   )}
 
-                  {/* 📏 NEW INSTRUCTION TIP BOX */}
+                  {/* 📏 INSTRUCTION TIP BOX */}
                   <div className="instruction-tip">
-                     📏 Position camera 10-12cm from rice
+                      📏 Position camera 10-12cm from rice
                   </div>
 
                   <div className="overlay-badge" style={{ background: canCapture ? '#16a34a' : '#dc2626' }}>
