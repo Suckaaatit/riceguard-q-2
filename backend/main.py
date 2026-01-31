@@ -17,24 +17,21 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import supervision as sv
-from inference_sdk import InferenceHTTPClient
+from roboflow import Roboflow
 import cloudinary
 import cloudinary.uploader
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION & SAFETY CONSTANTS
+# CONFIGURATION
 # -----------------------------------------------------------------------------
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB Limit
-MAX_RETRIES = 3                  # Retry AI model 3 times before failing
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("RiceGuard")
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path, override=True)
 
-# API Keys
+# API Keys & Config
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY")
 ROBOFLOW_MODEL_ID = os.getenv("ROBOFLOW_MODEL_ID")
 MONGODB_URL = os.getenv("MONGODB_URL")
@@ -43,47 +40,72 @@ CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
-# Calibration
-PX_TO_MM = float(os.getenv("PX_TO_MM", "0.19")) 
-WIDTH_CORRECTION = float(os.getenv("WIDTH_CORRECTION_FACTOR", "0.30")) 
-LENGTH_CORRECTION = float(os.getenv("LENGTH_CORRECTION_FACTOR", "1.0"))
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 # Initialize Cloudinary
 if CLOUDINARY_CLOUD_NAME:
-    cloudinary.config( 
-      cloud_name = CLOUDINARY_CLOUD_NAME, 
-      api_key = CLOUDINARY_API_KEY, 
-      api_secret = CLOUDINARY_API_SECRET 
-    )
+    try:
+        cloudinary.config( 
+          cloud_name = CLOUDINARY_CLOUD_NAME, 
+          api_key = CLOUDINARY_API_KEY, 
+          api_secret = CLOUDINARY_API_SECRET 
+        )
+    except Exception as e:
+        logger.error(f"Cloudinary Init Failed: {e}")
 
-# Initialize MongoDB
+# --- MONGODB CONNECTION CHECK ---
 mongo_client = None
 db = None
 history_collection = None
-if MONGODB_URL:
+
+app = FastAPI(title="RiceGuard API - Ultimate")
+
+@app.on_event("startup")
+async def _startup_mongo():
+    global mongo_client, db, history_collection
+
+    if not MONGODB_URL:
+        logger.warning("⚠️ MONGODB_URL not found in .env - History will NOT be saved.")
+        return
+
     try:
-        mongo_client = AsyncIOMotorClient(MONGODB_URL)
+        mongo_client = AsyncIOMotorClient(MONGODB_URL, serverSelectionTimeoutMS=5000)
+        await mongo_client.admin.command("ping")
         db = mongo_client[DB_NAME]
         history_collection = db["rice_history"]
-        logger.info("✅ Connected to MongoDB")
+        logger.info(f"✅ MongoDB ready (db={DB_NAME}, collection=rice_history)")
     except Exception as e:
-        logger.error(f"⚠️ MongoDB Connection Failed: {e}")
-
-# Initialize AI Client
-CLIENT = InferenceHTTPClient(
-    api_url="https://detect.roboflow.com",
-    api_key=ROBOFLOW_API_KEY
-)
-
-app = FastAPI(title="RiceGuard API - Production v2")
+        logger.error(f"⚠️ MongoDB Connection Failed ({type(e).__name__}): {e}")
+        logger.exception("⚠️ MongoDB Connection Failed")
+        mongo_client = None
+        db = None
+        history_collection = None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In real production, replace '*' with your actual domain
+    allow_origins=["*"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -----------------------------------------------------------------------------
+# AI MODEL LOADER
+# -----------------------------------------------------------------------------
+_rf_model = None
+
+def get_model():
+    global _rf_model
+    if _rf_model is None:
+        if not ROBOFLOW_API_KEY:
+            raise RuntimeError("CRITICAL: ROBOFLOW_API_KEY not found in .env")
+        rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+        project_id, version_num = ROBOFLOW_MODEL_ID.split("/")
+        _rf_model = rf.workspace().project(project_id).version(int(version_num)).model
+    return _rf_model
+
+# -----------------------------------------------------------------------------
+# DATA SCHEMAS
+# -----------------------------------------------------------------------------
 class AnalysisResult(BaseModel):
     total_grains: int
     whole_grains: int       
@@ -98,320 +120,273 @@ class AnalysisResult(BaseModel):
     warnings: List[str] = Field(default_factory=list)
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS (Preserving your original logic)
+# INTELLIGENT FILTERS (The Protection Layer)
 # -----------------------------------------------------------------------------
-# [...Insert your existing is_digital_screenshot, is_natural_object, parse_roboflow_manually here...]
-# (I am omitting the bodies to save space, but DO NOT DELETE THEM from your file)
+
 def is_digital_screenshot(img) -> bool:
+    """Detects digital screenshots (flat colors, UI elements)."""
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Histogram Check
         hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        if np.max(hist) / (img.shape[0] * img.shape[1]) > 0.15: return True
+        pixel_count = img.shape[0] * img.shape[1]
+        peak_val = np.argmax(hist)
+        max_peak = hist[peak_val]
+        
+        if 10 < peak_val < 245: 
+            if max_peak / pixel_count > 0.30: return True
+            
+        # 2. Smoothness Check
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < 3.0: return True 
+        
         return False
-    except: return False
+    except: 
+        return False
 
-def is_natural_object(crop_img) -> bool:
-    if crop_img.size == 0: return False
-    avg_color = np.mean(crop_img, axis=(0, 1))
-    if avg_color[0] > avg_color[1] * 1.2: return False # Blue/Sky check
-    return True
-
-def parse_roboflow_manually(json_result) -> sv.Detections:
-    # (Use your existing function code here)
-    preds = (json_result or {}).get("predictions", [])
-    if not preds: return sv.Detections.empty()
-    xyxy = []
-    class_id = []
-    confidence = []
-    class_names = []
-
-    name_to_id = {}
-    next_id = 0
-
-    for p in preds:
-        x = p.get("x")
-        y = p.get("y")
-        w = p.get("width")
-        h = p.get("height")
-
-        if x is None or y is None or w is None or h is None:
-            continue
-
-        x1 = float(x) - float(w) / 2.0
-        y1 = float(y) - float(h) / 2.0
-        x2 = float(x) + float(w) / 2.0
-        y2 = float(y) + float(h) / 2.0
-        xyxy.append([x1, y1, x2, y2])
-
-        conf = p.get("confidence", 0.0)
-        confidence.append(float(conf))
-
-        cls_name = p.get("class") or p.get("class_name") or ""
-        cls_name = str(cls_name)
-        class_names.append(cls_name)
-
-        cid = p.get("class_id")
-        if cid is None:
-            if cls_name not in name_to_id:
-                name_to_id[cls_name] = next_id
-                next_id += 1
-            cid = name_to_id[cls_name]
-        class_id.append(int(cid))
-
-    if not xyxy:
-        return sv.Detections.empty()
-
-    xyxy_arr = np.asarray(xyxy, dtype=float)
-    conf_arr = np.asarray(confidence, dtype=float)
-    class_id_arr = np.asarray(class_id, dtype=int)
-    class_names_arr = np.asarray(class_names, dtype=str)
-
+def contains_qr_code(img) -> bool:
+    """Explicitly checks for QR codes to block them."""
     try:
-        return sv.Detections(
-            xyxy=xyxy_arr,
-            confidence=conf_arr,
-            class_id=class_id_arr,
-            data={"class_name": class_names_arr},
-        )
-    except TypeError:
-        det = sv.Detections(xyxy=xyxy_arr, confidence=conf_arr, class_id=class_id_arr)
-        try:
-            det.data["class_name"] = class_names_arr
-        except Exception:
-            pass
-        return det
+        detector = cv2.QRCodeDetector()
+        data, bbox, _ = detector.detectAndDecode(img)
+        # If bbox is found, it's a QR code
+        if bbox is not None:
+            return True
+        return False
+    except:
+        return False
+
+def looks_like_rice(img) -> bool:
+    """
+    STRICT Organic Check:
+    1. Finds contours.
+    2. Rejects if too many objects are perfect squares (QR/Pixel art).
+    3. Rejects if objects are too random/noisy (Carpet/Shoe).
+    """
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        img_area = h * w
+        
+        # Blur to remove fine texture (carpet fibers)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        
+        # Adaptive threshold to find blobs
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY_INV, 11, 2)
+        
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_grains = 0
+        square_shapes = 0
+        total_shapes = 0
+
+        for c in cnts:
+            area = cv2.contourArea(c)
+            # Rice filter: Must be between 0.01% and 1% of image
+            if (img_area * 0.0001) < area < (img_area * 0.01):
+                total_shapes += 1
+                
+                # Check Geometry
+                x, y, cw, ch = cv2.boundingRect(c)
+                aspect_ratio = float(cw) / ch if ch > 0 else 0
+                
+                # QR Code / Pixel Art Check: Is it a perfect square?
+                # Rice is oblong (ratio != 1.0)
+                if 0.85 < aspect_ratio < 1.15:
+                    square_shapes += 1
+                else:
+                    valid_grains += 1
+
+        # 1. Not enough grains?
+        if valid_grains < 5:
+            return False
+
+        # 2. Too many squares? (It's a QR code or Grid)
+        if total_shapes > 0 and (square_shapes / total_shapes) > 0.4:
+            return False # >40% of objects are squares -> REJECT
+
+        return True
+    except:
+        return True 
+
+def _to_detections(result_json) -> sv.Detections:
+    """Helper to convert Roboflow JSON to Supervision Detections"""
+    from_roboflow = getattr(sv.Detections, "from_roboflow", None)
+    if callable(from_roboflow):
+        return from_roboflow(result_json)
+    
+    predictions = (result_json or {}).get("predictions", [])
+    if not predictions: return sv.Detections.empty()
+
+    xyxy = []
+    confidence = []
+    class_id = []
+    class_names = []
+    
+    unique_classes = sorted(list(set([p['class'] for p in predictions])))
+    name_map = {name: i for i, name in enumerate(unique_classes)}
+
+    for p in predictions:
+        x, y, w, h = p['x'], p['y'], p['width'], p['height']
+        xyxy.append([x - w/2, y - h/2, x + w/2, y + h/2])
+        confidence.append(p['confidence'])
+        class_names.append(p['class'])
+        class_id.append(name_map[p['class']])
+
+    return sv.Detections(
+        xyxy=np.array(xyxy),
+        confidence=np.array(confidence),
+        class_id=np.array(class_id),
+        data={'class_name': np.array(class_names)}
+    )
 
 # -----------------------------------------------------------------------------
-# CORE LOGIC WITH RETRY & SAFETY
+# CORE LOGIC
 # -----------------------------------------------------------------------------
-
 def analyze_logic(image_bytes: bytes) -> AnalysisResult:
+    # 1. Decode
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None: raise ValueError("Image decoding failed")
 
-    # [Logic A & B: Pre-processing & Screenshot Check] - Keep your existing code
-    h, w, _ = img.shape
-    if w != h:
-        min_dim = min(w, h)
-        img = img[(h-min_dim)//2:(h-min_dim)//2+min_dim, (w-min_dim)//2:(w-min_dim)//2+min_dim]
+    orig_h, orig_w, _ = img.shape
+    min_dim = min(orig_w, orig_h)
 
-    # [Logic C: Robust Inference with Retry]
+    # 2. FILTER: Explicit QR Code Check
+    if contains_qr_code(img):
+        raise HTTPException(status_code=400, detail="QR Code detected. Please upload rice grains.")
+
+    # 3. FILTER: Screenshot Check
+    if is_digital_screenshot(img):
+        raise HTTPException(status_code=400, detail="Screenshot detected. Please upload a real photo.")
+
+    # 4. FILTER: Strict Shape Analysis (No Squares/Noise)
+    if not looks_like_rice(img):
+         raise HTTPException(status_code=400, detail="No rice detected. Found mostly noise or synthetic patterns.")
+
+    # 5. Inference (HIGH CONFIDENCE)
     fd, img_path = tempfile.mkstemp(suffix=".jpg")
-    result = None
     try:
-        with os.fdopen(fd, 'wb') as tmp: 
-            _, encoded_img = cv2.imencode(".jpg", img)
-            tmp.write(encoded_img.tobytes())
+        with os.fdopen(fd, 'wb') as tmp: tmp.write(image_bytes)
         
-        # RETRY MECHANISM
-        for attempt in range(MAX_RETRIES):
-            try:
-                result = CLIENT.infer(img_path, model_id=ROBOFLOW_MODEL_ID)
-                try:
-                    preds_len = len((result or {}).get("predictions", []) or [])
-                    logger.info(f"Roboflow predictions: {preds_len}")
-                except Exception:
-                    logger.info("Roboflow predictions: <unavailable>")
-                break # Success!
-            except Exception as e:
-                if attempt == MAX_RETRIES - 1: raise e # Crash only on last attempt
-                time.sleep(0.5) # Wait before retry
-
+        # 🔥 CONFIDENCE BOOST: 40% (was 10-30%)
+        # Only accept if the AI is VERY sure it's rice
+        try:
+            result = get_model().predict(img_path, confidence=40, overlap=30).json()
+        except TypeError:
+            result = get_model().predict(img_path, confidence=40).json()
+    except Exception as e:
+        logger.error(f"Inference Error: {e}")
+        raise HTTPException(500, "AI Model Error")
     finally:
         if os.path.exists(img_path): os.remove(img_path)
 
-    # [Logic D-I: Filtering & Stats] - (Assume standard logic here for brevity)
-    # ... Your existing filtering logic ...
-    if not ROBOFLOW_MODEL_ID:
-        raise ValueError("ROBOFLOW_MODEL_ID is not set")
+    detections = _to_detections(result)
 
-    detections = parse_roboflow_manually(result)
-    if len(detections) == 0:
-        _, vis_buf = cv2.imencode(".jpg", img)
-        vis_b64 = base64.b64encode(vis_buf).decode()
-        return AnalysisResult(
-            total_grains=0,
-            whole_grains=0,
-            broken_grains=0,
-            chalky_grains=0,
-            foreign_matter=0,
-            avg_width_mm=0.0,
-            avg_length_mm=0.0,
-            visualization=vis_b64,
-            image_url="",
-            timestamp=datetime.now().strftime("%I:%M %p"),
-        )
+    # 6. Extract & Sanity Check Detections
+    widths = []
+    lengths = []
+    counts = {"good": 0, "broken": 0, "chalky": 0, "foreign": 0}
+    
+    valid_indices = []
 
-    class_names_arr = None
-    try:
-        class_names_arr = detections.data.get("class_name")
-    except Exception:
-        class_names_arr = None
-
-    raw_widths_mm = []
-    raw_lengths_mm = []
     for i in range(len(detections)):
         x1, y1, x2, y2 = detections.xyxy[i]
-        bbox_w_px = float(max(0.0, x2 - x1))
-        bbox_h_px = float(max(0.0, y2 - y1))
-        if bbox_w_px <= 0.0 or bbox_h_px <= 0.0:
-            raw_widths_mm.append(0.0)
-            raw_lengths_mm.append(0.0)
+        w_px = x2 - x1
+        h_px = y2 - y1
+        
+        # GEOMETRIC SANITY CHECKS:
+        
+        # A. Too Big? (Rice isn't half the image size)
+        if w_px > (orig_w * 0.2) or h_px > (orig_h * 0.2):
+            continue 
+            
+        # B. Too Small? (Noise)
+        if w_px < 10 or h_px < 10:
             continue
 
-        w_px = min(bbox_w_px, bbox_h_px)
-        l_px = max(bbox_w_px, bbox_h_px)
-        raw_widths_mm.append(w_px * PX_TO_MM * WIDTH_CORRECTION)
-        raw_lengths_mm.append(l_px * PX_TO_MM * LENGTH_CORRECTION)
+        # C. Aspect Ratio Check (Rice is oblong)
+        # Rejects squares (0.9 to 1.1 ratio) which usually indicate pixels/QR blocks
+        ratio = w_px / h_px if h_px > 0 else 0
+        if 0.85 < ratio < 1.15:
+            continue # Skip perfectly square detections
 
-    valid_raw_widths = [w for w in raw_widths_mm if w > 0]
-    median_width = float(np.median(valid_raw_widths)) if valid_raw_widths else 0.0
+        valid_indices.append(i)
+        
+        cls = str(detections.data['class_name'][i]).lower()
+        if "broken" in cls: counts["broken"] += 1
+        elif "chalky" in cls: counts["chalky"] += 1
+        elif "foreign" in cls: counts["foreign"] += 1
+        else: counts["good"] += 1 
 
-    if median_width < 1.3:
-        raise HTTPException(status_code=400, detail=f"Camera too far! (Est. {median_width:.2f}mm). Move closer to 10-12cm.")
-    if median_width > 5.0:
-        raise HTTPException(status_code=400, detail=f"Camera too close! (Est. {median_width:.2f}mm). Move back.")
+        widths.append(min(w_px, h_px))
+        lengths.append(max(w_px, h_px))
+        
+    if len(valid_indices) < len(detections):
+        try:
+            detections = detections[np.array(valid_indices)]
+        except:
+             pass # Handle empty array edge case
 
-    if len(valid_raw_widths) > 5:
-        std_dev = float(np.std(valid_raw_widths))
-        if std_dev > 1.5:
-            _, vis_buf = cv2.imencode(".jpg", img)
-            vis_b64 = base64.b64encode(vis_buf).decode()
-            return AnalysisResult(
-                total_grains=0,
-                whole_grains=0,
-                broken_grains=0,
-                chalky_grains=0,
-                foreign_matter=0,
-                avg_width_mm=0.0,
-                avg_length_mm=0.0,
-                visualization=vis_b64,
-                image_url="",
-                timestamp=datetime.now().strftime("%I:%M %p"),
-            )
-
-    valid_indices = []
-    final_widths = []
-    final_lengths = []
-
-    for i in range(len(detections)):
-        w_mm = float(raw_widths_mm[i])
-        h_mm = float(raw_lengths_mm[i])
-        if w_mm <= 0.0 or h_mm <= 0.0:
-            continue
-
-        ratio = h_mm / w_mm if w_mm > 0 else 0.0
-        if (1.5 <= w_mm <= 3.5) and (3.0 <= h_mm <= 10.0) and (ratio > 1.4):
-            valid_indices.append(i)
-            final_widths.append(w_mm)
-            final_lengths.append(h_mm)
-
-    if len(valid_indices) == 0:
-        _, vis_buf = cv2.imencode(".jpg", img)
-        vis_b64 = base64.b64encode(vis_buf).decode()
+    # 7. Minimum Grain Count Check
+    # Need at least 8 confirmed non-square grains to pass
+    if len(valid_indices) < 8:
+        _, buf = cv2.imencode(".jpg", img)
         return AnalysisResult(
-            total_grains=0,
-            whole_grains=0,
-            broken_grains=0,
-            chalky_grains=0,
-            foreign_matter=0,
-            avg_width_mm=0.0,
-            avg_length_mm=0.0,
-            visualization=vis_b64,
-            image_url="",
+            total_grains=0, whole_grains=0, broken_grains=0, 
+            chalky_grains=0, foreign_matter=0, 
+            avg_width_mm=0.0, avg_length_mm=0.0,
+            visualization=base64.b64encode(buf).decode(),
             timestamp=datetime.now().strftime("%I:%M %p"),
+            warnings=["No rice grains found (objects were noise/squares)."]
         )
 
-    idx = np.array(valid_indices, dtype=int)
-    try:
-        detections = detections[idx]
-    except Exception:
-        data = {}
-        try:
-            for k, v in (detections.data or {}).items():
-                try:
-                    data[k] = np.asarray(v)[idx]
-                except Exception:
-                    pass
-        except Exception:
-            data = {}
+    # 8. Distance & Calibration Logic
+    avg_w = 0.0
+    avg_l = 0.0
+    
+    if len(widths) > 0:
+        median_px_width = float(np.median(widths))
+        width_ratio = median_px_width / float(min_dim)
 
-        conf = None
-        cls_id = None
-        try:
-            conf = np.asarray(detections.confidence)[idx] if detections.confidence is not None else None
-        except Exception:
-            conf = None
-        try:
-            cls_id = np.asarray(detections.class_id)[idx] if detections.class_id is not None else None
-        except Exception:
-            cls_id = None
+        if width_ratio < 0.005:
+            raise HTTPException(400, "Camera too far! Grains too small. Move to 10-12cm.")
+        if width_ratio > 0.035:
+            raise HTTPException(400, "Camera too close! Move back.")
 
-        if conf is None and cls_id is None:
-            detections = sv.Detections(xyxy=np.asarray(detections.xyxy)[idx], data=data)
-        else:
-            detections = sv.Detections(
-                xyxy=np.asarray(detections.xyxy)[idx],
-                confidence=conf,
-                class_id=cls_id,
-                data=data,
-            )
+        estimated_px_to_mm = 2.2 / median_px_width
+        avg_w = round(np.median(widths) * estimated_px_to_mm, 2)
+        avg_l = round(np.median(lengths) * estimated_px_to_mm, 2)
 
-    avg_w = float(np.median(final_widths)) if final_widths else 0.0
-    avg_l = float(np.median(final_lengths)) if final_lengths else 0.0
-    avg_w = round(avg_w, 2)
-    avg_l = round(avg_l, 2)
-
-    counts = {"good": 0, "broken": 0, "chalky": 0, "foreign": 0}
-    for i in range(len(detections)):
-        cls_name = ""
-        try:
-            cls_name = str(detections.data.get("class_name")[i])
-        except Exception:
-            cls_name = ""
-        cls_norm = cls_name.lower().strip()
-        if "broken" in cls_norm:
-            counts["broken"] += 1
-        elif "chalk" in cls_norm:
-            counts["chalky"] += 1
-        elif "foreign" in cls_norm or "matter" in cls_norm or "impur" in cls_norm:
-            counts["foreign"] += 1
-        else:
-            counts["good"] += 1
-
-    annotated = img.copy()
+    # 9. Visualization
+    vis_b64 = ""
     try:
         box_annotator = sv.BoxAnnotator(thickness=2)
-        label_annotator = sv.LabelAnnotator(text_scale=0.5, text_padding=5)
-        labels = []
-        for k in range(len(detections)):
-            try:
-                labels.append(str(detections.data.get("class_name")[k]))
-            except Exception:
-                labels.append("")
+        annotated = img.copy()
         annotated = box_annotator.annotate(scene=annotated, detections=detections)
-        annotated = label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
-    except Exception:
-        pass
+        _, buf = cv2.imencode(".jpg", annotated)
+        vis_b64 = base64.b64encode(buf).decode()
+    except:
+        _, buf = cv2.imencode(".jpg", img)
+        vis_b64 = base64.b64encode(buf).decode()
 
-    _, vis_buf = cv2.imencode(".jpg", annotated)
-    vis_b64 = base64.b64encode(vis_buf).decode()
-
-    # [Logic J: Cloudinary Upload]
+    # 10. Cloudinary Upload
     upload_url = ""
     if CLOUDINARY_CLOUD_NAME:
         try:
             resp = cloudinary.uploader.upload(
                 f"data:image/jpg;base64,{vis_b64}",
-                folder="rice_guard_history", tags=["rice_history"]
+                folder="rice_guard_history", 
+                tags=["rice_history"]
             )
             upload_url = resp.get("secure_url")
         except Exception as e:
-            logger.error(f"Cloudinary Error: {e}")
+            logger.error(f"Cloudinary upload failed: {e}")
 
     return AnalysisResult(
-        total_grains=len(detections),
+        total_grains=len(valid_indices),
         whole_grains=counts["good"],
         broken_grains=counts["broken"],
         chalky_grains=counts["chalky"],
@@ -424,51 +399,41 @@ def analyze_logic(image_bytes: bytes) -> AnalysisResult:
     )
 
 # -----------------------------------------------------------------------------
-# SECURE API ENDPOINTS
+# ENDPOINTS
 # -----------------------------------------------------------------------------
 
 @app.post("/analyze", response_model=AnalysisResult)
 async def analyze(file: UploadFile = File(...)):
-    # 1. VALIDATE FILE TYPE
     if not file.content_type.startswith("image/"):
         raise HTTPException(400, "File must be an image")
     
-    # 2. VALIDATE FILE SIZE (The "Memory Bomb" Fix)
-    # Read in chunks to avoid blowing up RAM, or check Content-Length header
-    file.file.seek(0, 2)
-    file_size = file.file.tell()
-    file.file.seek(0)
-    
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(413, f"File too large. Limit is {MAX_FILE_SIZE/1024/1024}MB")
-
     try:
         contents = await file.read()
         result = await run_in_threadpool(analyze_logic, contents)
-
-        # 3. DB SAVE
-        if history_collection is not None:
-            try:
-                await history_collection.insert_one({
-                    "total_grains": int(result.total_grains),
-                    "whole_grains": int(result.whole_grains),
-                    "broken_grains": int(result.broken_grains),
-                    "chalky_grains": int(result.chalky_grains),
-                    "foreign_matter": int(result.foreign_matter),
-                    "avg_width_mm": float(result.avg_width_mm),
-                    "avg_length_mm": float(result.avg_length_mm),
-                    "image_url": result.image_url or "",
-                    "created_at": datetime.utcnow(),
-                    "display_time": result.timestamp
-                })
-            except Exception as e:
-                logger.error(f"Mongo Insert Error: {e}")
-
-        return result
-    except HTTPException as he: raise he
+    except HTTPException as he:
+        raise he
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(500, "Internal Analysis Error")
+        raise HTTPException(500, f"Analysis failed: {str(e)}")
+
+    if history_collection is not None:
+        try:
+            await history_collection.insert_one({
+                "total_grains": int(result.total_grains),
+                "whole_grains": int(result.whole_grains),
+                "broken_grains": int(result.broken_grains),
+                "chalky_grains": int(result.chalky_grains),
+                "foreign_matter": int(result.foreign_matter),
+                "avg_width_mm": float(result.avg_width_mm),
+                "avg_length_mm": float(result.avg_length_mm),
+                "image_url": result.image_url or "",
+                "created_at": datetime.utcnow(),
+                "display_time": result.timestamp
+            })
+        except Exception:
+            logger.exception("DB Insert failed")
+
+    return result
 
 @app.get("/history")
 async def get_history():
@@ -477,14 +442,10 @@ async def get_history():
         cursor = history_collection.find().sort("created_at", -1).limit(20)
         items = []
         async for doc in cursor:
-            ts = doc.get("display_time")
-            if not ts and doc.get("created_at"):
-                ts = doc.get("created_at").strftime("%I:%M %p")
-            
             items.append({
                 "id": str(doc.get("_id")),
                 "url": doc.get("image_url", ""),
-                "timestamp": ts,
+                "timestamp": doc.get("display_time", ""),
                 "stats": {
                     "total": doc.get("total_grains", 0),
                     "whole": doc.get("whole_grains", 0),
@@ -492,7 +453,8 @@ async def get_history():
                 }
             })
         return items
-    except Exception: return []
+    except Exception:
+        return []
 
 @app.get("/health")
 def health(): return {"status": "ok"}

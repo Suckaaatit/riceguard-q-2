@@ -6,7 +6,9 @@ const RiceGuardApp = () => {
   // CONFIGURATION
   // ---------------------------------------------------------------------------
   // ⚠️ Point this to your FastAPI Backend URL
-  const API_BASE = ""; 
+  // If testing on Android Emulator use "http://10.0.2.2:8000"
+  // If testing on Physical Phone use "http://YOUR_PC_IP:8000"
+  const API_BASE = import.meta.env.VITE_API_BASE || "http://10.187.60.131:8000"; 
   // ---------------------------------------------------------------------------
 
   // --- STATE ---
@@ -15,7 +17,7 @@ const RiceGuardApp = () => {
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  
+   
   // History State
   const [history, setHistory] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -24,10 +26,10 @@ const RiceGuardApp = () => {
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [guidance, setGuidance] = useState('Ready to capture');
   const [canCapture, setCanCapture] = useState(false);
-  
+   
   // Tap-to-Focus State
   const [focusBox, setFocusBox] = useState({ x: 0, y: 0, visible: false });
-  
+   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const lastVibrate = useRef(0);
@@ -200,27 +202,33 @@ const RiceGuardApp = () => {
 
       const response = await fetch(`${API_BASE}/analyze`, { method: 'POST', body: formData });
       
-      // Safety check for non-200 responses
+      // --- DISTANCE LOGIC INTEGRATION START ---
+      // We read the body first because we might need the error detail
+      const data = await response.json().catch(() => ({}));
+
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Server error");
+        // If it's a 400 error, it's likely our "Camera Too Far/Close" check
+        if (response.status === 400 && data.detail) {
+            setError(`⚠️ ${data.detail}`); // Display the distance warning
+            triggerVibration(300); // Vibrate to alert user
+        } else {
+            throw new Error(data.detail || "Server error");
+        }
+        return; // Stop here, do not proceed to setResults
       }
+      // --- DISTANCE LOGIC INTEGRATION END ---
 
-      const data = await response.json();
-
-      if (data.total_grains === 0 && !data.warnings.includes("Screenshot detected")) {
+      if (data.total_grains === 0 && !data.warnings?.includes("Screenshot detected")) {
         setResults(null);
         setError("No rice grains detected.");
         triggerVibration(500); 
       } else {
         setResults(data);
         
-        // --- SENIOR DEV FIX: OPTIMISTIC UPDATE ---
-        // Don't wait for the DB. Create the history item NOW using the data we just got.
-        // If the backend failed to upload to Cloudinary, we use the base64 visualization as fallback.
+        // --- OPTIMISTIC UPDATE ---
         const newHistoryItem = {
            url: data.image_url || `data:image/jpeg;base64,${data.visualization}`,
-           timestamp: data.timestamp, // "6:10 PM" from backend
+           timestamp: data.timestamp, 
            stats: {
              total: data.total_grains,
              whole: data.whole_grains,
@@ -228,7 +236,6 @@ const RiceGuardApp = () => {
            }
         };
 
-        // Add to top of list instantly
         setHistory(prevHistory => [newHistoryItem, ...prevHistory]);
       }
       
